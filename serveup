@@ -1,0 +1,230 @@
+#!/bin/sh
+
+usage () {
+  echo "Usage: $0 [-h] [-p] [-i php_ini_file] [-s mod_php5_file] [-m mime_types_file] [-M modules_dir] [-l listen_address] [-c extra_config_file] [directory]"
+  echo " -h print this usage and exit"
+  echo " -p enable php, changes DirectoryIndex to: index.php index.html index.htm"
+  echo " -i set php.ini to use (copied to tmp and used with PHPINIDir)"
+  echo " -m set mime.types file to use"
+  echo " -M set Apache modules directory to use (default: $default_modules_dir)"
+  echo " -s set the path to the mod_php5 shared library (default: $default_php5_module_file)"
+  echo " -l set address to Listen on, can be used multiple times (up to 10)"
+  echo "    default [::1]:8000 and 127.0.0.1:8000"
+  echo " -c set extra apache config file that will be included"
+}
+
+init_vars() {
+  php_enabled=0
+  default_modules_dir="/usr/lib/httpd/modules"
+  default_php5_module_file="${default_modules_dir}/libphp5.so"
+}
+
+parse_params () {
+
+  while getopts hpi:m:M:s:l:c: f ; do
+    case $f in
+      h) usage ; exit 0; ;;
+      p) php_enabled=1 ;;
+      i) if [ -f "$OPTARG" ] ; then
+           php_ini_file="$OPTARG"
+         else
+           echo "Can't find php.ini $OPTARG" >&2
+           exit 1
+         fi ;;
+      c) if [ -f "$OPTARG" ] ; then
+           extra_config_file="$OPTARG"
+         else
+           echo "Can't find extra config file $OPTARG" >&2
+           exit 1
+         fi ;;
+      M) if [ -d "$OPTARG" ] ; then
+           apache_modules_dir="$OPTARG"
+         else
+           echo "Can't find modules dir $OPTARG" >&2
+           exit 1
+         fi ;;
+      m) if [ -f "$OPTARG" ] ; then
+           mime_types_file="$OPTARG"
+         else
+           echo "Can't find mime.types file $OPTARG" >&2
+           exit 1
+         fi ;;
+      s) if [ -f "$OPTARG" ] ; then
+           php5_module_file="$OPTARG"
+         else
+           echo "Can't find mod_php5 library file $OPTARG" >&2
+           exit 1
+         fi ;;
+      l) add_listen "$OPTARG" ;;
+      \?) usage; exit 1; ;;
+    esac
+  done
+  shift $((OPTIND - 1))
+  docroot="$1"
+}
+
+make_config () {
+
+  if [ "$php_enabled" != "1" ] ; then
+    if [ "x$php_ini_file" != "x" ] ; then echo "Ignoring -i, PHP not enabled" >&2 ; php_ini_file= ; fi
+    if [ "x$php5_module_file" != "x" ] ; then echo "Ignoring -s, PHP not enabled" >&2 ; php_module_file= ; fi
+  fi
+
+  if [ "x$docroot" = "x" ] ; then
+    docroot="$(pwd)"
+  else
+    docroot="$(realpath "$docroot")" || exit 1
+  fi
+  tmpdir="$(mktemp -d --tmpdir)" || exit 1
+  if [ "x$apache_modules_dir" != "x" ] ; then
+    ln -s "$apache_modules_dir" "${tmpdir}/modules"
+  else
+    ln -s "$default_modules_dir" "${tmpdir}/modules"
+  fi
+  conffile="${tmpdir}/httpd.conf"
+
+  if [ "x$mime_types_file" != "x" ] ; then
+    cp "$mime_types_file" "${tmpdir}/mime.types"
+  else
+    cat > "${tmpdir}/mime.types" << EOF
+text/html html htm
+text/plain txt text
+text/css css
+application/xhtml+xml xhtml xht
+application/javascript js
+application/json json
+application/xml xml xsl
+image/gif gif
+image/jpeg jpg jpeg
+image/png png
+image/x-icon ico
+application/x-font-woff woff
+EOF
+  fi
+
+  if [ "x$php_ini_file" != "x" ] ;  then
+    cp "$php_ini_file" "${tmpdir}/php.ini"
+  fi
+
+  if [ "x$extra_config_file" != "x" ] ; then
+    cp "$extra_config_file" "${tmpdir}/extra.conf"
+  fi
+
+  exec 3> "$conffile"
+
+
+  cat >&3 << EOF
+
+# logs
+ErrorLog /dev/stdout
+
+PidFile httpd.pid
+
+# select MPM
+LoadModule mpm_prefork_module modules/mod_mpm_prefork.so
+# must load security module
+LoadModule unixd_module modules/mod_unixd.so
+# must load authn_core
+LoadModule authn_core_module modules/mod_authn_core.so
+# and authz_core for "Require all granted"
+LoadModule authz_core_module modules/mod_authz_core.so
+# to enable index (default index.html)
+LoadModule dir_module modules/mod_dir.so
+# to enable autoindex
+LoadModule autoindex_module modules/mod_autoindex.so
+# to load mime types
+LoadModule mime_module modules/mod_mime.so
+# in case people want to rewrite via .htaccess
+LoadModule rewrite_module modules/mod_rewrite.so
+EOF
+
+  if [ "$php_enabled" = "1" ] ; then
+    if [ "x$php5_module_file" != "x" ] ; then
+      echo "LoadModule php5_module $php5_module_file" >&3
+    else
+      echo "LoadModule php5_module $default_php5_module_file" >&3
+    fi
+    echo "DirectoryIndex index.php index.html index.htm" >&3
+    if [ "x$php_ini_file" != "x" ] ; then
+      echo "PHPINIDir $tmpdir" >&3
+    fi
+    cat >&3 << EOF
+<FilesMatch "\\.php\$">
+  SetHandler application/x-httpd-php
+</FilesMatch>
+<FilesMatch "\\.phps\$">
+  SetHandler application/x-httpd-php-source
+</FilesMatch>
+EOF
+  fi
+
+  has_custom_listen=0
+  for listen in "$listen_0" "$listen_1" "$listen_2" "$listen_3" "$listen_4" \
+    "$listen_5" "$listen_6" "$listen_7" "$listen_8" "$listen_9" ; do
+    if [ "x$listen" != "x" ] ; then
+      echo "Listen ${listen}" >&3
+      has_custom_listen=1
+    fi 
+  done
+
+  if [ "$has_custom_listen" = "0" ] ; then
+    echo "Listen [::1]:8000" >&3
+    echo "Listen 127.0.0.1:8000" >&3
+  fi
+
+  cat >&3 << EOF
+
+# dev server does not need lots of spare servers
+MaxSpareServers 2
+MinSpareServers 1
+StartServers 3
+# the default for prefork MaxRequestWorkers / MaxClients is 256, should be enough
+
+TypesConfig mime.types
+
+DocumentRoot "$docroot"
+<Directory />
+  Require all denied
+  AllowOverride None
+</Directory>
+<Directory "$docroot">
+  Require all granted
+  Options +Indexes
+  AllowOverride All
+</Directory>
+EOF
+
+  if [ "x$extra_config_file" != "x" ] ; then
+    echo "Include extra.conf" >&3
+  fi
+
+  exec 3>&-
+
+}
+
+
+
+cleanup () {
+  if [ "$cleaned_up" = "0" ] ; then
+    cleaned_up=1
+    sleep 3
+    rm "${tmpdir}/modules"
+    rm "${tmpdir}/httpd.conf"
+    rm "${tmpdir}/mime.types"
+    rm -f "${tmpdir}/httpd.pid"
+    rm -f "${tmpdir}/php.ini"
+    rm -f "${tmpdir}/extra.conf"
+    rmdir "$tmpdir"
+  fi
+}
+
+umask 077
+init_vars
+parse_params "$@"
+make_config
+cleaned_up=0
+trap "cleanup" 0 INT TERM
+
+# run in foreground
+httpd -d "$tmpdir" -f "$conffile" -DFOREGROUND
+
